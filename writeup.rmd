@@ -1,0 +1,1834 @@
+---
+title: "\\vspace{-2cm} Classification Challenge Code Writeup"
+subtitle: "Candidate 13343"
+output: pdf_document
+---
+\vspace{-1.9cm}
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,
+                      fig.align="center")
+
+set.seed(1)
+```
+
+# Introduction 
+
+In `writeup.pdf`, I explain my process of selecting a model that classifies a set of Wikipedia Talk Page comments either as an attack or not. The full code for the analysis and all models are in the `writeup.rmd` file, from which the PDF file is compiled. The full code for the final submitted model is presented in `code.rmd` and compiled to `code.pdf`, with the details of the model explained in the writeup.
+
+I first load and explore any statistics or patterns of the data. Then I create a feature representation of the data using a bag-of-words approach and add a few custom features. I then test several learning algorithms including Naive Bayes, LASSO, SVM, Random Forest, and Multi-Layer Perceptron model. I select the best performing model based on its F1 score on a validation set and then use the selected model to predict labels for the 100,000 observations in the test set and submit these predictions to the online challenge. 
+
+## Loading and Exploring the Data
+
+The data are comprised of two sets: **(1)** 15,000 observations in the training data ("training set") with comment text labelled either as *1* - an attack or *0* - not an attack, and **(2)** 100,000 observations in unlabeled held-out data ("testing set") for which the selected model will predict labels. Table 1 shows the distribution of the class labels. We can see that it is unbalanced with there being a larger proportion of non-attack comments.
+
+```{r message=FALSE}
+# load required libraries
+library(quanteda)
+library(quanteda.textmodels)
+library(quanteda.dictionaries)
+library(quanteda.sentiment)
+library(e1071)
+library(ggplot2)
+library(spacyr)
+library(glmnet)
+library(ranger)
+library(dplyr)
+library(tidyr)
+library(doMC)
+library(lexicon)
+library(stringr)
+library(kableExtra)
+library(caret)
+library(pander)
+library(knitr)
+library(broom)
+library(stargazer)
+library(formatR)
+library(scales)
+library(keras)
+library(quanteda.classifiers)
+```
+
+```{r cache=TRUE}
+# read in the data from csv files
+train_data <- read.csv("train.csv", stringsAsFactors = FALSE)
+test_data <- read.csv("test.csv", stringsAsFactors = FALSE)
+
+# create two corpora from the comment text
+train_corpus <- corpus(train_data, text_field = "text")
+test_corpus <- corpus(test_data, text_field = "text")
+```
+
+```{r cache=TRUE}
+# Table: distribution of attack labels
+table(docvars(train_corpus, "attack")) %>% 
+  kbl(booktabs = T, 
+      caption = "Distribution of labels in training data",
+      col.names = c("Attack label", "Frequency")) %>% 
+  kable_styling(latex_options =  c("striped", "HOLD_position"), 
+                full_width = FALSE)
+```
+
+The wordcloud below gives a brief overview of the top features across comment type in the training set, excluding punctuation, symbols, and English stopwods. **Content warning:** It is apparent from this visualisation that attack comments exhibit more profane, aggressive language.
+
+```{r cache=TRUE, fig.width=4, fig.height=4, eval=FALSE}
+# create simple dfm from corpus
+train_simple_dfm <- dfm(train_corpus, 
+                        remove_punc = TRUE, 
+                        remove_symbols = TRUE, 
+                        remove_numbers = TRUE,
+                        remove = c(stopwords("en")))
+
+# add attack variable as character
+docvars(train_simple_dfm, "attack_char") <- ifelse(train_data$attack == 0, "non-attack", "attack")
+
+# Plot: wordcloud of features now in training dfm 
+# which are attack/no attack
+# wordcloud saved as png and loaded into doc below
+train_simple_dfm %>% 
+  dfm_group(group = "attack_char") %>% 
+  textplot_wordcloud(comparison = TRUE, rotation = 0, 
+                     min_size = 0.8, max_size = 3.6, max_words = 250,
+                     color = c("red", "purple4"))
+```
+
+<br>
+\centering
+![](plots/wordcloud.png){height=35%}
+<br>
+
+\raggedright
+\newpage
+\vspace{-2.5cm}
+# Descriptive Analysis 
+\vspace{-0.25cm}
+## Length of comments
+\vspace{-0.25cm}
+I first explored differences of comment lengths (based on number of words) between attacks/non-attacks. We can see the difference is not statistically significant, and the distribution of comment lengths is shown in the boxplot below.
+
+```{r message=FALSE, warning=FALSE, cache=TRUE}
+# number of documents labelled as attack/non-attack
+n_noattack <- ndoc(corpus_subset(train_corpus, attack == 0))
+n_attack <- ndoc(corpus_subset(train_corpus, attack == 1))
+
+# create separate corpora of attack/no attack
+corpus_noattack <- corpus_subset(train_corpus, attack == 0)
+corpus_attack <- corpus_subset(train_corpus, attack == 1)
+
+# store length of comments 
+length_noattack <- ntoken(corpus_noattack) 
+length_attack <- ntoken(corpus_attack)
+
+# t-test of significance
+# to see if difference in lengths
+pander(t.test(length_noattack,
+              length_attack,
+              alternative = c("two.sided")),
+       split.tables = Inf)
+```
+
+```{r cache=TRUE, message=FALSE, warning=FALSE, eval=FALSE}
+# create data frame to store lengths
+length_df <- data.frame(values = c(length_noattack, length_attack),
+                        type = c(rep("non-attack", n_noattack),
+                                 rep("attack", n_attack)))
+
+# Plot: boxplot of length by comment type
+comment_length_plot <- ggplot(length_df, 
+                              aes(x = values, 
+                                  y = type,
+                                  fill = type)) +
+  geom_boxplot() +
+  # exclude outliers for better visualisation
+  scale_x_continuous(limits = c(0, 100)) +
+  # adjust plot labels
+  labs(title = "Length of comments in training set by type",
+       subtitle = "Excluding outliers with greater than 100 words",
+       x = "Number of words",
+       y = "Type of comment") +
+  # adjust theme and color elements
+  theme_bw() + 
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        plot.margin = unit(c(0.5, 0.5, 0.5, 0.5), "cm")) +
+  scale_fill_brewer(palette = "Pastel1")
+
+# save as .png file
+ggsave(comment_length_plot, file = "comment_length_plot.png", height = 4, width = 6.5)
+```
+
+<br>
+\centering
+![](plots/comment_length_plot.png){height=26%}
+<br>
+
+\raggedright
+\vspace{-1cm}
+## Amount of punctuation
+\vspace{-0.25cm}
+Moreover, the average number of punctuation characters doesn't significantly differ either, with attack comments only having about 0.1 more on average. This is shown by the t-test and boxplot below.
+
+```{r cache=TRUE}
+# create full dfm for both attack/no attack 
+dfm_full_noattack <- dfm(corpus_noattack)
+dfm_full_attack <- dfm(corpus_attack)
+  
+# create dfm with no punctuation for attack/no attack
+dfm_nopunc_noattack <- dfm(corpus_noattack, 
+                           remove_punct = TRUE, 
+                           verbose = FALSE)
+
+dfm_nopunc_attack <- dfm(corpus_attack, 
+                         remove_punct = TRUE,
+                         verbose = FALSE)
+
+# get number of punctuation in each comment for attack/no attack 
+length_punc_noattack <- ntoken(dfm_full_noattack) - ntoken(dfm_nopunc_noattack)
+length_punc_attack <- ntoken(dfm_full_attack) - ntoken(dfm_nopunc_attack)
+
+# compare the lengths using t-test of significance
+pander(t.test(length_punc_noattack,
+              length_punc_attack,
+              alternative = c("two.sided")),
+       split.tables = Inf)
+```
+
+```{r cache=TRUE, eval=FALSE, message=FALSE, warning=FALSE}
+# create data frame for graphing
+punct_df <- data.frame(values = c(length_punc_noattack, length_punc_attack),
+                       type = c(rep("non-attack", n_noattack),
+                                rep("attack", n_attack)))
+
+# graph boxplot of length by type
+punctuation_plot <- ggplot(punct_df, 
+                           aes(x = values, 
+                               y = type,
+                               fill = type)) +
+  geom_boxplot() +
+  # limit axis for visualisation
+  scale_x_continuous(limits = c(0, 20)) +
+  # adjust plot labels 
+  labs(title = "Amount of punctuation in training set by type",
+       subtitle = "Excluding outliers with greater than 20 punctuation characters ",
+       x = "Number of punctuation characters",
+       y = "Type of comment") +
+  # adjust theme and color elements
+  theme_bw() + 
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        plot.margin = unit(c(0.5, 0.5, 0.5, 0.5), "cm")) +
+  scale_fill_brewer(palette = "Pastel1")
+
+# save as .png file
+ggsave(punctuation_plot, file = "punctuation_plot.png", height = 4, width = 6.5)
+```
+
+<br>
+\centering
+![](plots/punctuation_plot.png){height=26%}
+<br>
+
+\raggedright
+
+## Parts of speech
+
+Next, I looked at the average proportion of different parts of speech across each comment type. This was done by using `spacyr` to carry out part of speech tagging on each unique word in the corpus. I then used each part of speech as an associated dictionary key, and applied the custom dictionary to the data, where each comment was represented as a vector of word proportions (to normalize for comment length).
+
+The differences in proportion of parts of speech between the two comment types are shown in the table and boxplot below (which excludes proper nouns, symbols and numerals because the proportions are too small to visualise). We can see that, generally, each type of comment contains relatively the same proportion of parts of speech, with attack comments featuring more pronouns, possibly indicating they are more personal.
+
+```{r cache=TRUE}
+# create a simple dfm of all comments in training set, 
+# trimming to most frequent features
+dfm_pos <- dfm_trim(dfm(train_corpus,
+                        remove_url = TRUE),
+                    min_docfreq = 10)
+
+# extract all unique words from the dfm 
+# (i.e., all words in the comments)
+words <- featnames(dfm_pos)
+```
+
+```{r eval=FALSE}
+# parse the words to tag their parts of speech
+# using spacyr package
+words_parsed <- spacy_parse(words)
+saveRDS(words_parsed, "words_parsed.RDS")
+```
+
+```{r cache=TRUE}
+# load object above since takes a while to run 
+words_parsed <- readRDS("words_parsed.RDS")
+```
+
+```{r cache=TRUE}
+# save words under each part of speech from the parsed words
+adjectives <- with(words_parsed, subset(token, pos == "ADJ"))
+adpositions <- with(words_parsed, subset(token, pos == "ADP"))
+adverbs <- with(words_parsed, subset(token, pos == "ADV"))
+auxiliaries <- with(words_parsed, subset(token, pos == "AUX"))
+conjunctions <- with(words_parsed, subset(token, pos == "CONJ"))
+cor_conjunctions <- with(words_parsed, subset(token, pos == "CCONJ"))
+sub_conj <- with(words_parsed, subset(token, pos == "SCONJ"))
+determiners <- with(words_parsed, subset(token, pos == "DET"))
+interjections <- with(words_parsed, subset(token, pos == "INTJ"))
+nouns <- with(words_parsed, subset(token, pos == "NOUN"))
+numerals <- with(words_parsed, subset(token, pos == "NUM"))
+particles <- with(words_parsed, subset(token, pos == "PART"))
+pronouns <- with(words_parsed, subset(token, pos == "PRON"))
+proper_nouns <- with(words_parsed, subset(token, pos == "PROPN"))
+punctuations <- with(words_parsed, subset(token, pos == "PUNCTS"))
+symbols <- with(words_parsed, subset(token, pos == "SYM"))
+verbs <- with(words_parsed, subset(token, pos == "VERB"))
+others <- with(words_parsed, subset(token, pos == "X"))
+spaces <- with(words_parsed, subset(token, pos == "SPACE"))
+
+# create part of speech dictionary, excluding rare/uninportant 
+# parts of speech (commented out)
+pos_dict <- dictionary(list(adjectives = adjectives, 
+                            # adpositions = adpositions,
+                            adverbs = adverbs,
+                            # auxiliaries = auxiliaries,
+                            # cor_conjunctions = cor_conjunctions,
+                            # sub_conj = sub_conj,
+                            determiners = determiners,
+                            interjections = interjections,
+                            nouns = nouns, 
+                            numerals = numerals,
+                            # conjunctions = conjunctions,
+                            # particles = particles, 
+                            pronouns = pronouns,
+                            proper_nouns = proper_nouns,
+                            # punctuations = punctuations,
+                            symbols = symbols,
+                            verbs = verbs
+                            # others = others
+                            # spaces = spaces
+                            ))
+
+# apply dictionary to weighted dfm of comments
+dfm_pos_wght <- dfm_lookup(dfm_weight(dfm_pos, 
+                                      scheme = "prop"),
+                           dictionary = pos_dict)
+
+# look at mean proportions for attak/no attack in each
+# part of speech
+rbind(attack = round(colMeans(dfm_subset(dfm_pos_wght, attack == 0)), 3),
+      non_attack = round(colMeans(dfm_subset(dfm_pos_wght, attack == 1)), 3)) %>%
+  t() %>% 
+  kbl(booktabs = T, 
+      caption = "Average proportion of each part of speech in each comment",
+      col.names = c("Attack", "Non-attack")) %>% 
+  kable_styling(latex_options =  c("striped", "HOLD_position"), 
+                full_width = FALSE)
+```
+
+```{r warning=FALSE, message=FALSE, cache=TRUE, eval=FALSE}
+# create data frames to plot the differences
+pos_df <- cbind(convert(dfm_pos_wght, to = "data.frame"),
+                type = ifelse(docvars(dfm_pos_wght, "attack") == 0, "non-atatck", "attack"))
+
+# pivot longer for plotting
+pos_df_long <- pos_df %>% 
+  pivot_longer(cols = colnames(pos_df)[2:11],
+               names_to = "part_of_speech", 
+               values_to = "proportion")
+
+# order based on average value of atatck comments
+pos_order_df <- pos_df_long %>% 
+  group_by(part_of_speech, type) %>% 
+  summarise(mean = mean(proportion)) %>% 
+  arrange(type, desc(mean))
+
+# save ordering and save as factor for variable
+pos_order <- as.vector(unlist(pos_order_df[1:10, 1]))
+pos_df_long$part_of_speech <- factor(pos_df_long$part_of_speech,
+                                     levels = pos_order,
+                                     ordered = TRUE)
+
+# Plot: boxplot of part of speech proportion
+pos_plot <- pos_df_long %>% 
+  # exclude proper nounds, symbols, numerals
+  filter(part_of_speech %in% pos_order[1:7]) %>% 
+  ggplot(aes(x = proportion, 
+             y = part_of_speech,
+             fill = type)) +
+  geom_boxplot() +
+  coord_flip() +
+  # limit axis for visualisation
+  scale_x_continuous(limits = c(0, 0.20)) +
+  # adjust plot labels 
+  labs(title = "Proportion of part of speech across comment types",
+       subtitle = "Excluding outliers greater than 20%",
+       x = "Proportion of comment",
+       y = "Part of speech") +
+  # adjust theme and colour elements
+  theme_bw() + 
+  theme(legend.position = "right",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        plot.margin = unit(c(0.5, 0.5, 0.5, 0.5), "cm")) +
+  scale_fill_brewer(palette = "Pastel1")
+
+# save as .png file
+ggsave(pos_plot, file = "pos_plot.png", height = 5.25, width = 8)
+```
+
+<br>
+\centering
+![](plots/pos_plot.png){height=50%}
+<br>
+
+\raggedright
+
+## Number of words in all caps - custom feature
+
+Words in all capital letters tend to indicate shouting or anger online, which might suggest an attack. To find the number of all caps words in each comment I first removed all URLs in the text to avoid capturing all caps URLS. Then I counted the number of all caps words with two or more letters. Below is the beginning of the comment with the highest number of capital letter words ("OH NOES" repeated over one thousand times).
+
+```{r cache=TRUE}
+# remove URLS before counting capital letters
+# used regex pattern from: https://stackoverflow.com/questions/2
+# 6496538/extract-urls-with-regex-into-a-new-data-frame-column/26498790
+url_pattern <- "http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+"
+
+# replace urls for both corpora (since adding as feature later)
+train_corpus_no_url <- gsub(url_pattern, "", train_corpus)
+test_corpus_no_url <- gsub(url_pattern, "", test_corpus)
+
+# count number of capital words
+# used regex pattern from: https://stackoverflow.com/questions/
+# 33197733/how-to-count-capslock-in-string-using-r
+train_num_capital_words <- str_count(train_corpus_no_url, "\\b[A-Z]{2,}\\b")
+test_num_capital_words <- str_count(test_corpus_no_url, "\\b[A-Z]{2,}\\b")
+
+# text with most capital words in training corpus 
+wrap_rmd(text = substr(as.vector(train_data$text[which(train_num_capital_words == max(train_num_capital_words))]),
+                      1, 79))
+```
+
+Below is the beginning of another example of a comment with many capital letters. The above is not labelled as an attack, whereas below is.
+
+```{r}
+# another example of many capital words
+wrap_rmd(text = substr(train_data$text[185], 1, 192))
+
+# add as a docvar
+docvars(train_corpus, "num_capital_words") <- train_num_capital_words
+```
+
+Below we can see the number of all caps words differs across comment type, with attack comments typically containing a greater amount of all caps words. Therefore, I decided to add this as a custom feature, as perhaps the number of capital words would help discriminate between comment type.
+
+```{r cache=TRUE}
+# use t-test of significance
+# to see if difference in capital letter words
+num_capital_words_noattack <- docvars(corpus_subset(train_corpus, attack == 0), "num_capital_words")
+num_capital_words_attack <- docvars(corpus_subset(train_corpus, attack == 1), "num_capital_words")
+
+pander(t.test(num_capital_words_noattack,
+              num_capital_words_attack,
+              alternative = c("two.sided")),
+       split.tables = Inf)
+```
+
+## Number of exclamation marks - custom feature
+
+The number of exclamation marks might indicate anger, which might more likely be an attack online. The beginning of comment below is the comment in the training set with the greater number of exclamations, which is labelled as an attack.
+
+```{r cache=TRUE, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+# count number of exclamation marks for both corpora
+train_num_exclamation <- str_count(train_corpus_no_url, '!')
+test_num_exclamation <- str_count(test_corpus_no_url, '!')
+
+# look at training text with most exclamation 
+# (only first 100 characters)
+# printing below in code chunk so text wraps
+most_excl = as.vector(train_data$text[which(train_num_exclamation == max(train_num_exclamation))])
+
+print(substr(most_excl, 1, 80))
+```
+
+We can see in the table and t-test below that indeed comments which are attacks have a greater number of exclamation marks, on average. Therefore, I added this as a custom feature as well, since other punctuation is excluded from feature representation.
+
+```{r cache=TRUE}
+# add as a docvar to train corpus
+docvars(train_corpus, "num_exclamations") <- train_num_exclamation
+```
+
+```{r cache=TRUE}
+# use t-test of significance
+# to see if difference in lengths
+num_exclamation_mark_noattack <- docvars(corpus_subset(train_corpus, attack == 0), "num_exclamations")
+num_exclamation_mark_attack <- docvars(corpus_subset(train_corpus, attack == 1), "num_exclamations")
+
+pander(t.test(num_exclamation_mark_noattack,
+              num_exclamation_mark_attack,
+              alternative = c("two.sided")),
+       split.tables = Inf)
+```
+
+\newpage
+
+# Feature Representation
+
+## Creating a document-feature-matrix 
+
+After exploring the data, I chose to use a bag-of-words approach for feature representation. I transformed the texts for both the training and testing set into document-feature-matrices (dfms), where each document (i.e., each comment) is represented by a vector of word counts for each unique word in the corpora. I removed all punctuation, numbers, urls, symbols, words with only 1 letter, and English stopwords from the texts in each dataset. I removed these as most of these features would not provide much discriminative information (aside from exclamation marks, later added back).
+
+I also included bi-grams in each dfm to identify possible collocations, and, again, to only include the most important and discriminant features, I trimmed the dfm to only include words that occur in more than 10 documents. Finally, I stemmed the words to prevent collinearity. For training the models and using them for prediction, I made sure the features were identical between the two datasets by joining on the common words and creating a combined dfm.
+
+```{r cache=TRUE}
+# make train corpus dfm, no stemming 
+train_dfm_nostem <- train_corpus %>%
+  # remove numbers and punctution
+  tokens(remove_punct = TRUE,
+         remove_numbers = TRUE
+    ) %>% 
+  # remove stopwords and common words
+  tokens_remove(c(stopwords("en")),
+                padding = TRUE
+    ) %>% 
+  # select features of at least 2 letters
+  tokens_select(min_nchar = 2L
+    ) %>%
+  # select bi-grams
+  tokens_ngrams(n = 1:2) %>% 
+  dfm(remove_symbols = TRUE,
+      remove_url = TRUE,
+      stem = FALSE,
+      verbose = FALSE
+    ) %>% 
+  # trim to most frequent features
+  dfm_trim(min_docfreq = 10,
+           # min_termfreq = 15,
+           verbose = FALSE)
+
+# stem dfm 
+train_dfm <- dfm(train_dfm_nostem, 
+                 stem = TRUE, 
+                 verbose = FALSE)
+```
+
+```{r cache=TRUE}
+# do the same to the test dfm 
+test_dfm_nostem <- test_corpus %>%
+  tokens(remove_punct = TRUE,
+         remove_numbers = TRUE
+         ) %>%
+  tokens_remove(c(stopwords("en")), 
+                padding = TRUE
+                ) %>% 
+  tokens_select(min_nchar = 2L
+                ) %>%
+  tokens_ngrams(n = 1:2
+                ) %>% 
+  dfm(remove_symbols = TRUE,
+      remove_url = TRUE,
+      stem = FALSE,
+      verbose = FALSE
+      ) %>% 
+  dfm_trim(min_docfreq = 10,
+           # min_termfreq = 70,
+           verbose = FALSE)
+
+test_dfm <- dfm(test_dfm_nostem, 
+                stem = TRUE, 
+                verbose = FALSE)
+```
+
+```{r cache=TRUE}
+# get common words between train 
+# and test sets
+common_feats <- intersect(featnames(train_dfm), featnames(test_dfm))
+
+# code check lengths 
+# length(featnames(train_dfm))
+# length(featnames(test_dfm))
+# length(common_feats)
+
+# combine the train and test dfms on 
+# the common features
+comb_dfm <- rbind(train_dfm[,common_feats], 
+                  test_dfm[,common_feats])
+
+# add attack as docvar
+docvars(comb_dfm, "attack") <- as.factor(c(docvars(train_dfm, "attack"), rep(NA, 100000)))
+
+# add attack as docvar as character
+docvars(comb_dfm, "attack_char") <- as.factor(c(ifelse(docvars(train_dfm, "attack") == 0,
+                                                       "non-attack",
+                                                       "attack"), 
+                                                rep(NA, 100000)))
+```
+
+Next, I identified and removed more top frequency words across both comment types which were likely to be non-discriminative. **Content warning:** Shown in the below plots are the top 20 words in each comment type and their relative frequencies. I decided to trim the common features "article", "page", "edit", "wikipedia", "can", "one", "just", and "like" from the dfm.
+
+```{r cache=TRUE, eval=TRUE}
+# sort term frequencies
+# used help from source: 
+# https://quanteda.io/articles/pkgdown/
+# replication/digital-humanities.html
+train_dfm_noattack <- dfm_subset(comb_dfm, attack == 0)
+train_dfm_attack <- dfm_subset(comb_dfm, attack == 1)
+
+train_sorted_feat_freqs_noattack <- topfeatures(train_dfm_noattack, n = nfeat(train_dfm_noattack))
+train_sorted_feat_freqs_attack <- topfeatures(train_dfm_attack, n = nfeat(train_dfm_attack))
+
+# relative term frequencies
+train_sorted_rel_freqs_noattack <- ( train_sorted_feat_freqs_noattack / 
+                                       sum(train_sorted_feat_freqs_noattack) ) * 100
+train_sorted_rel_freqs_attack <- ( train_sorted_feat_freqs_attack / 
+                                     sum(train_sorted_feat_freqs_attack) ) * 100
+```
+
+```{r cache=TRUE, eval=FALSE}
+relfreq_noattack <- data.frame(feature = names(train_sorted_rel_freqs_noattack[1:20]),
+                               relative_frequency = train_sorted_rel_freqs_noattack[1:20])
+
+relfreq_noattack$feature <- factor(relfreq_noattack$feature,
+                                   levels = relfreq_noattack$feature,
+                                   ordered = TRUE)
+
+# plotting help from: 
+# https://stackoverflow.com/questions/50633972/
+# how-to-plot-line-chart-with-opened-circles-in-r
+no_attack_feats <- ggplot(relfreq_noattack,
+                          aes(x = feature,
+                              y = relative_frequency,
+                              group = 1)) +
+  geom_line(color = 'darkgreen') +
+  geom_point(shape = 21,
+             color = 'darkgreen',
+             fill='white') +
+  # adjust plot labels 
+  labs(title = "Relative frequency of top 20 features in non-attack comments",
+       x = "Feature",
+       y = "Percentage of full text") +
+  # adjust theme and colour elements
+  theme_bw() + 
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(size = 10, angle = 70,
+                                   vjust = 0.5),
+        plot.margin = unit(c(0.5, 0.5, 0.5, 0.5), "cm")) +
+  scale_fill_brewer(palette = "Pastel1")
+```
+
+```{r cache=TRUE, eval=FALSE}
+relfreq_attack <- data.frame(feature = names(train_sorted_rel_freqs_attack[1:20]),
+                             relative_frequency = train_sorted_rel_freqs_attack[1:20])
+
+relfreq_attack$feature <- factor(relfreq_attack$feature,
+                                 levels = relfreq_attack$feature,
+                                 ordered = TRUE)
+
+# Plot: relative frequency of words in attack comments
+attack_feats <- ggplot(relfreq_attack,
+                        aes(x = feature,
+                            y = relative_frequency,
+                            group = 1)) +
+  geom_line(color = 'red') +
+  geom_point(shape = 21,
+             color = 'red',
+             fill='white') +
+  # adjust plot labels 
+  labs(title = "Relative frequency of top 20 features in attack comments",
+       x = "Feature",
+       y = "Percentage of full text") +
+  # adjust theme and colour elements
+  theme_bw() + 
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(size = 10, angle = 70,
+                                   vjust = 0.5),
+        plot.margin = unit(c(0.5, 0.5, 0.5, 0.5), "cm"))
+
+# save as .png file
+ggsave("top_feats.png", arrangeGrob(no_attack_feats, attack_feats))
+```
+
+<br>
+\centering
+![](plots/top_feats.png){height=60%}
+<br>
+
+\raggedright
+
+```{r cache=TRUE, message=FALSE, warning=FALSE}
+# trim dfm more from common features
+comb_dfm <- dfm_remove(comb_dfm, 
+                        c("articl", "page", "edit", "wikipedia", 
+                          "can", "one", "just", "like"), 
+                        verbose = TRUE)
+```
+
+## Profanity count - custom feature
+
+Next, I created another custom feature which counts the frequency of profanity words in each document. This could again be an indicator of an attack. To do so, I applied a dictionary of profanity words, which was a merging of the profanity dictionaries from the `lexicon` r package and from the ["Offensive/Profane Word List"](https://www.cs.cmu.edu/~biglou/resources/bad-words.txt) from Luis von Ahn's Research Group. In total, the dictionary had 1222 profanity words.
+
+Attack comments contain an average of 8.02 profane words, where as non-attack comments contain an average of 0.5. A t-test was performed on comments with at least 1 profane word, and we can see that attack comments still have a significantly higher amount.
+
+```{r cache=TRUE, message=FALSE, warning=FALSE}
+# profanity list from https://www.cs.cmu.edu/~biglou/resources/bad-words.txt
+cs_bad_words <- read.delim("bad-words.txt")
+
+# profanity lists from 'lexicon' package
+profanity_list <- c(profanity_alvarez,
+                    profanity_arr_bad,
+                    profanity_banned,
+                    profanity_racist,
+                    # profanity_zac_anger,
+                    as.vector(cs_bad_words))
+
+# subset to only unique words
+profanity_list_unique <- unique(profanity_list)
+
+# number of profanity words
+# length(profanity_list_unique)
+```
+
+```{r cache=TRUE, message=FALSE, warning=FALSE}
+# create dictionary from list
+profanity_dict <- dictionary(list(profanity_word = profanity_list_unique))
+
+# look at difference in profanity between attack/no attack
+# using unstemmed dfms
+train_profanity_dfm <- dfm_lookup(train_dfm_nostem,
+                                  dictionary = profanity_dict)
+
+test_profanity_dfm <- dfm_lookup(test_dfm_nostem,
+                                 dictionary = profanity_dict)
+
+profanity_noattack_dfm <- dfm_subset(train_profanity_dfm, attack == 0)[,]
+profanity_attack_dfm <- dfm_subset(train_profanity_dfm, attack == 1)[,]
+
+# remover zero values for computational efficiency
+# (too sparse for t-test)
+profanity_noattack <- convert(profanity_noattack_dfm, to = "data.frame") %>% 
+  filter(profanity_word != 0) %>% 
+  select(profanity_word)
+
+profanity_attack <- convert(profanity_attack_dfm, to = "data.frame") %>% 
+  filter(profanity_word != 0) %>% 
+  select(profanity_word)
+
+pander(t.test(profanity_noattack, 
+              profanity_attack,
+              alternative = "two.sided"),
+       split.tables = Inf)
+```
+
+## Sentiment and emotion - custom feature
+
+Next, I added more custom features which indicate the comment sentiment and emotion, using the NRC lexicon. This pre-made dictionary corresponds words across two sentiments (positive and negative) and eight emotions (anger, anticipation, disgust, fear, joy, sadness, surprise, and trust). 
+
+I applied the NRC dictionary to the dfm where word counts were weighted to be proportions to normalize for document length. We can see that on average, comments which are attacks have greater anger, disgust, fear, sadness, and surprise, and overall greater negative sentiment. Therefore, I used these values as features in the dfm, and excluded the emotions of anticipation and joy, for which there was no significant difference.
+
+```{r cache=TRUE}
+# create copy of NRC dictionary to relabel emotions/sentiment
+data_dictionary_NRC_copy <- data_dictionary_NRC
+
+# save names for output
+output_names <- names(data_dictionary_NRC)
+
+# rename sentiment so that it doesn't overlap when combining dfm
+names(data_dictionary_NRC_copy) <- c("anger_sent", "anticipation_sent", 
+                                     "disgust_sent", "fear_sent", "joy_sent", 
+                                     "negative_sent", "positive_sent", "sadness_sent", 
+                                     "surprise_sent", "trust_sent")
+
+# apply dictionary to weighted training and testing data
+train_sent_dfm <- dfm_lookup(dfm_weight(train_dfm_nostem,
+                                        # smoothing = 1,
+                                        scheme = "prop"),
+                             dictionary = data_dictionary_NRC_copy)
+
+test_sent_dfm <- dfm_lookup(dfm_weight(test_dfm_nostem,
+                                       # smoothing = 1,
+                                        scheme = "prop"),
+                             dictionary = data_dictionary_NRC_copy)
+
+# look at average difference between attack/no attack
+rbind(non_attack = round(colMeans(dfm_subset(train_sent_dfm, attack == 0)), 3),
+      attack = round(colMeans(dfm_subset(train_sent_dfm, attack == 1)), 3)) %>% 
+  kbl(booktabs = T, 
+      caption = "NRC Lexicon average sentiment and emotion in each document",
+      col.names = output_names) %>% 
+  kable_styling(latex_options =  c("striped", "HOLD_position"), 
+                full_width = FALSE)
+```
+
+```{r cache=TRUE}
+# create data frame to display results
+sent_ttest_df <- data.frame(emotion = output_names, 
+                            p_value = NA)
+
+# iterate over each emotion
+for (i in c(1:10)) {
+  
+  # perform t-test
+  ttest_res <- t.test(as.vector(dfm_subset(train_sent_dfm, attack == 0)[,i]), 
+                      as.vector(dfm_subset(train_sent_dfm, attack == 1)[,i]), 
+                      alternative = "two.sided")
+  
+  # store p-value
+  sent_ttest_df[i, 2] <- ttest_res$p.value
+  
+}
+
+# format p-value for table
+sent_ttest_df$p_value <- ifelse(sent_ttest_df$p_value <= 0.1, 
+                                scientific(sent_ttest_df$p_value, digits = 3),
+                                round(sent_ttest_df$p_value, 3))
+
+# Table: p-value of t-tests
+sent_ttest_df %>% 
+  kbl(booktabs = T, 
+      caption = "Welch Two sample t-test for difference across comment type") %>% 
+  kable_styling(latex_options =  c("striped", "HOLD_position"), 
+                full_width = FALSE)
+```
+
+```{r cache=TRUE}
+# remove the insignificant differences
+train_sent_dfm <- train_sent_dfm[, -c(2, 5)] 
+test_sent_dfm <- test_sent_dfm[, -c(2, 5)]
+```
+
+```{r cache=TRUE, message=FALSE, warning=FALSE}
+# add the nine custom features
+comb_dfm_custom <- cbind(comb_dfm, 
+                         # add sentiment and emotion proportion as featurs
+                         rbind(train_sent_dfm, test_sent_dfm),
+                         # add profanity count as features
+                         rbind(train_profanity_dfm, test_profanity_dfm))
+
+final_dfm <- cbind(comb_dfm_custom,
+                   # add capital word count as feature
+                   rbind(as.dfm(data.frame(num_capital_words = train_num_capital_words)),
+                         as.dfm(data.frame(num_capital_words = test_num_capital_words))),
+                   # add num exclamation marks as features
+                   rbind(as.dfm(data.frame(num_exclamation = train_num_exclamation)),
+                         as.dfm(data.frame(num_exclamation = test_num_exclamation))))
+
+# add back attack and doc id 
+# add attack docvar
+docvars(final_dfm, "attack") <- as.factor(c(docvars(train_dfm, "attack"), rep(NA, 100000)))
+docvars(final_dfm, "id") <- c(docvars(train_dfm, "id"), docvars(test_dfm, "id"))
+```
+
+# Model Selection
+
+After representing the features in the data as bag-of-words and adding custom features, I also weighed the dfm using tf-idf weighting, which is a combination of term frequency (to remove rare terms) and inverse document frequency (weights words that appear in the most documents). I tested both the weighted and unweighted dfms in the analysis.
+
+To begin, I subsetting a labelled, held-out dataset from the training data to use as a validation set to approximate the performance for the test set. I used 3,000 observations for the validation set, leaving 12,000 observations to train the models on (80% of the training data).
+
+```{r cache=TRUE}
+# subset training and validation sets
+tr <- c(1:12000)
+val <- c(12001:15000)
+te <- c(15001:115000)
+
+train_set <- final_dfm[tr,]
+val_set <- final_dfm[val,]
+test_set <- final_dfm[te,]
+```
+
+```{r cache=TRUE}
+# weight the dfm using tfidf
+final_dfm_wght <- dfm_tfidf(final_dfm)
+
+# subset training and validation sets
+train_set_wght <- final_dfm_wght[tr,]
+val_set_wght <- final_dfm_wght[val,]
+test_set_wght <- final_dfm_wght[te,]
+```
+
+```{r cache=TRUE}
+# weight the dfm using prop
+final_dfm_prop <- dfm_weight(final_dfm, 
+                             scheme = "prop")
+
+# subset training and validation sets
+train_set_prop <- final_dfm_prop[tr,]
+val_set_prop <- final_dfm_prop[val,]
+test_set_prop <- final_dfm_prop[te,]
+```
+
+```{r cache=TRUE}
+# subset the labels as factors (same for each dfm)
+train_class <- as.factor(docvars(comb_dfm[tr,], "attack"))
+val_class <- as.factor(docvars(comb_dfm[val,], "attack"))
+```
+
+## Naive Bayes
+
+The first model I tested was Naïve Bayes, a supervised learning model popularly used for text data. The model uses Baye's rule to determine the class posterior probabilities of each word, and then aggregates to determine the class probabilities for each document, assuming conditional independence. My first submission to the competition was using the Naive Bayes model on the dfm without any of the custom features mentioned above. This resulted in an F1 score of 0.5938 on 20% the testing set. For my second submission, I added the custom features to the model (exclamation count, capital words count, sentiment/emotion proportion scores) and this yielded an F1 score of 0.64558 on 20% of the testing set.
+
+I ran the model on both the unweighted and tf-idf weighted dfm, and performance of the Naive Bayes model (including all custom features) on the training and validation sets is shown below, with the best validation score bolded below. 
+
+```{r cache=TRUE, eval=FALSE}
+# create outcome data frame for performances
+nb_performance_df <- data.frame(dfm_type = NA,
+                                dataset = NA, 
+                                precision = NA, 
+                                recall = NA, 
+                                f1 = NA, 
+                                accuracy = NA)
+```
+
+```{r cache=TRUE, eval=FALSE}
+# run simple NB model on training set, 
+# weighted and unweighted
+nb_mod <- textmodel_nb(train_set, train_class)
+nb_mod_wt <- textmodel_nb(train_set_wght, train_class)
+
+# predict the labels for the training and validation sets
+nb_tr_preds <- predict(nb_mod, newdata = train_set) 
+nb_val_preds <- predict(nb_mod, newdata = val_set) 
+nb_tr_preds_wt <- predict(nb_mod, newdata = train_set_wght) 
+nb_val_preds_wt <- predict(nb_mod, newdata = val_set_wght) 
+
+# create confusion matrix and get performance stats
+nb_tr_confmat <- table(nb_tr_preds, train_class)
+nb_val_confmat <- table(nb_val_preds, val_class)
+nb_tr_confmat_wt <- table(nb_tr_preds_wt, train_class)
+nb_val_confmat_wt <- table(nb_val_preds_wt, val_class)
+
+nb_tr_stats <- confusionMatrix(nb_tr_confmat, positive = "1", mode = "prec_recall")
+nb_val_stats <- confusionMatrix(nb_val_confmat, positive = "1", mode = "prec_recall")
+nb_tr_stats_wt <- confusionMatrix(nb_tr_confmat_wt, positive = "1", mode = "prec_recall")
+nb_val_stats_wt <- confusionMatrix(nb_val_confmat_wt, positive = "1", mode = "prec_recall")
+
+# enter results into data frame
+nb_performance_df[1, 1] <- "unweighted"
+nb_performance_df[1, 2] <- "training"
+nb_performance_df[1, 3] <- nb_tr_stats$byClass[5]
+nb_performance_df[1, 4] <- nb_tr_stats$byClass[6]
+nb_performance_df[1, 5] <- nb_tr_stats$byClass[7]
+nb_performance_df[1, 6] <- nb_tr_stats$overall[1]
+
+nb_performance_df[2, 1] <- "unweighted"
+nb_performance_df[2, 2] <- "validation"
+nb_performance_df[2, 3] <- nb_val_stats$byClass[5]
+nb_performance_df[2, 4] <- nb_val_stats$byClass[6]
+nb_performance_df[2, 5] <- nb_val_stats$byClass[7]
+nb_performance_df[2, 6] <- nb_val_stats$overall[1]
+
+nb_performance_df[3, 1] <- "weighted"
+nb_performance_df[3, 2] <- "training"
+nb_performance_df[3, 3] <- nb_tr_stats_wt$byClass[5]
+nb_performance_df[3, 4] <- nb_tr_stats_wt$byClass[6]
+nb_performance_df[3, 5] <- nb_tr_stats_wt$byClass[7]
+nb_performance_df[3, 6] <- nb_tr_stats_wt$overall[1]
+
+nb_performance_df[4, 1] <- "weighted"
+nb_performance_df[4, 2] <- "validation"
+nb_performance_df[4, 3] <- nb_val_stats_wt$byClass[5]
+nb_performance_df[4, 4] <- nb_val_stats_wt$byClass[6]
+nb_performance_df[4, 5] <- nb_val_stats_wt$byClass[7]
+nb_performance_df[4, 6] <- nb_val_stats_wt$overall[1]
+
+saveRDS(nb_performance_df, "nb_performance_df.RDS")
+```
+
+```{r}
+# load in data frame saved from above
+nb_performance_df <- readRDS("nb_performance_df.RDS")
+
+# round values
+nb_performance_df[,-c(1:2)] <- round(nb_performance_df[,-c(1:2)], 3)
+
+nb_performance_df %>% 
+  kbl(booktabs = T, 
+      caption = "Naive Bayes model performance") %>% 
+  kable_styling(latex_options =  c("striped", "HOLD_position"), 
+                full_width = FALSE) %>% 
+  row_spec(2, bold = T)
+```
+
+## LASSO regression
+
+Next, I applied a Lasso regression model, which performs regression but adds a shrinkage penalty to large coefficients and shrinks them towards zero using the L1 norm. This is useful because often text data has many features but is sparse, and a model with regularization allows for a sort of feature selection of the most important words.
+
+I implemented the model using 5-fold cross-validation to select the optimal tuning parameter lambda, which additionally controls the way in which coefficients are shrunken. Since the class distribution is imbalanced, I also added class weights (shown in the table below) to the model hyperparameters to give more attention to the minority class (attack).
+
+```{r cache=TRUE, eval=TRUE}
+# Compute weights to balance class selection
+# used help from source: 
+# https://stats.stackexchange.com/questions/171380/
+# implementing-balanced-random-forest-brf-in-r-using-randomforests
+
+# save number of observations
+# and the associated classes
+n_obs <- length(train_data$attack)
+classes <- train_data$attack
+
+w <- 1/table(classes)
+w <- w/sum(w)
+weights <- rep(0, n_obs)
+weights[classes == 0] <- w['0']
+weights[classes == 1] <- w['1']
+
+# save weights for training data
+tr_weights <- weights[tr]
+
+cbind(class = c(1, 0),
+      data.frame(table(tr_weights))) %>%
+  kbl(booktabs = T, 
+      caption = "Class label weights",
+      col.names = c("Class", "Weight", "Frequency")) %>% 
+  kable_styling(latex_options =  c("striped", "HOLD_position"), 
+                full_width = FALSE)
+```
+
+```{r cache=TRUE, eval=FALSE}
+# create outcome data frame for performances
+lasso_performance_df <- data.frame(lambda = NA,
+                                   dfm_type = NA,
+                                   dataset = NA, 
+                                   precision = NA, 
+                                   recall = NA, 
+                                   f1 = NA, 
+                                   accuracy = NA)
+```
+
+```{r cache=TRUE, eval=FALSE}
+# register cores to run in parallel
+registerDoMC(cores = 4) 
+
+# run lasso regression on weighted and unweighted dfm
+lasso_mod <- cv.glmnet(x = train_set[,],
+                       y = train_class,
+                       alpha = 1,
+                       nfolds = 5,
+                       parallel = TRUE,
+                       weights = tr_weights,  
+                       family = "binomial")
+
+lasso_mod_wt <- cv.glmnet(x = train_set_wght[,],
+                          y = train_class, 
+                          alpha = 1, 
+                          nfolds = 5,
+                          parallel = TRUE, 
+                          weights = tr_weights,  
+                          family = "binomial")
+
+# get training and validation set predictions
+lasso_tr_preds <- predict(lasso_mod, train_set, type = "class")
+lasso_val_preds <- predict(lasso_mod, val_set, type = "class")
+lasso_tr_preds_wt <- predict(lasso_mod, train_set_wght, type = "class")
+lasso_val_preds_wt <- predict(lasso_mod, val_set_wght, type = "class")
+
+# create confusion matrix and get performance stats
+lasso_tr_confmat <- table(lasso_tr_preds, train_class)
+lasso_val_confmat <- table(lasso_val_preds, val_class)
+lasso_tr_confmat_wt <- table(lasso_tr_preds_wt, train_class)
+lasso_val_confmat_wt <- table(lasso_val_preds_wt, val_class)
+
+lasso_tr_stats <- confusionMatrix(lasso_tr_confmat, positive = "1", mode = "prec_recall")
+lasso_val_stats <- confusionMatrix(lasso_val_confmat, positive = "1", mode = "prec_recall")
+lasso_tr_stats_wt <- confusionMatrix(lasso_tr_confmat_wt, positive = "1", mode = "prec_recall")
+lasso_val_stats_wt <- confusionMatrix(lasso_val_confmat_wt, positive = "1", mode = "prec_recall")
+
+# enter results into data frame
+lasso_performance_df[1, 1] <- "unweighted"
+lasso_performance_df[1, 2] <- "training"
+lasso_performance_df[1, 3] <- lasso_tr_stats$byClass[5]
+lasso_performance_df[1, 4] <- lasso_tr_stats$byClass[6]
+lasso_performance_df[1, 5] <- lasso_tr_stats$byClass[7]
+lasso_performance_df[1, 6] <- lasso_tr_stats$overall[1]
+
+lasso_performance_df[2, 1] <- "unweighted"
+lasso_performance_df[2, 2] <- "validation"
+lasso_performance_df[2, 3] <- lasso_val_stats$byClass[5]
+lasso_performance_df[2, 4] <- lasso_val_stats$byClass[6]
+lasso_performance_df[2, 5] <- lasso_val_stats$byClass[7]
+lasso_performance_df[2, 6] <- lasso_val_stats$overall[1]
+
+lasso_performance_df[3, 1] <- "weighted"
+lasso_performance_df[3, 2] <- "training"
+lasso_performance_df[3, 3] <- lasso_tr_stats_wt$byClass[5]
+lasso_performance_df[3, 4] <- lasso_tr_stats_wt$byClass[6]
+lasso_performance_df[3, 5] <- lasso_tr_stats_wt$byClass[7]
+lasso_performance_df[3, 6] <- lasso_tr_stats_wt$overall[1]
+
+lasso_performance_df[4, 1] <- "weighted"
+lasso_performance_df[4, 2] <- "validation"
+lasso_performance_df[4, 3] <- lasso_val_stats_wt$byClass[5]
+lasso_performance_df[4, 4] <- lasso_val_stats_wt$byClass[6]
+lasso_performance_df[4, 5] <- lasso_val_stats_wt$byClass[7]
+lasso_performance_df[4, 6] <- lasso_val_stats_wt$overall[1]
+
+# add log-lambda values
+lasso_performance_df2 <- cbind(log_lambda = c(rep(round(log(lasso_mod$lambda.min), 3), 2), 
+                                              rep(round(log(lasso_mod_wt$lambda.min), 3), 2)),
+                               lasso_performance_df)
+
+saveRDS(lasso_performance_df2, "lasso_performance_df2.RDS")
+```
+
+Despite the advantages of this learning model, the LASSO on both the weighted and unweighted dfm performed worse than Naive Bayes. The log-lambda value was the same for both dfm types, with the weighted dfm performing slightly better on the validation set. Perhaps the pre-processed dfm was not sparse or informative enough for the model to be effective and would instead benefit from using ridge regression and the L2 norm, where coefficients are not completely zeroed out. These are questions to explore in further analysis.
+
+```{r, eval=TRUE}
+# load in data frame saved from above
+lasso_performance_df <- readRDS("lasso_performance_df2.RDS")
+
+# round values
+lasso_performance_df[,-c(1:3)] <- round(lasso_performance_df[,-c(1:3)], 3)
+
+lasso_performance_df %>% 
+  kbl(booktabs = T, 
+      row.names = F,
+      caption = "Lasso model performance") %>% 
+  kable_styling(latex_options =  c("striped", "HOLD_position"), 
+                full_width = FALSE) %>% 
+  row_spec(4, bold = T)
+```
+
+## Support Vector Machine
+
+I next tried using a linear support vector machine (SVM) on the data, which finds a separating hyperplane between the two classes. I expected the model would perform well since textual data is high-dimensional and therefore is very likely linearly separable. Therefore, I would expect an SVM with a linear kernel that finds a linear decision boundary to perform well.
+
+I again added class weights for the model to focus on observations inversely proportional to the class distribution. I tuned the cost hyperparameter _C_, for values of 0.001, 0.01, 0.1, 1, 5, and 100. The cost *C* acts as a budget for the amount and degree to which the margin (i.e., the distance from the hyperplane to each class) is violated by the observations. This indeed was able to outperform the two previous models, and the top values are shown below. Oftentimes lower values of *C* created high fit but high variance, and higher values potentially introduced too much vias by allowing for more violations to the margin.
+
+```{r eval=FALSE}
+# create outcome data frame for performances with class weights
+svm_performance_df_class_wt <- data.frame(dfm_type = NA,
+                                 dataset = NA,
+                                 Cs = rep(Cs, 2),
+                                 precision = NA, 
+                                 recall = NA, 
+                                 f1 = NA, 
+                                 accuracy = NA)
+```
+
+```{r eval=FALSE}
+# cost hyperparameter to search over
+# can also use tune() to perform a grid sarch 
+# of different values of C, 
+# but wanted all model outputs
+Cs <- c(0.001, 0.01, 0.1, 1, 5, 10, 100)
+
+# initialise list to store svm models
+svm_mods2 <- list()
+
+# iterate over each cost hyperparamter
+for (i in 1:length(Cs)) {
+  
+  # run linear svm on dfm
+  svm_mod <- svm(x = train_set[,],
+                 y = train_class,
+                 kernel = "linear",
+                 cost = Cs[i], 
+                 # add class weights
+                 class.weights = c("0" = 0.2148,
+                                   "1" = 0.7852))
+  
+  # save into list object
+  svm_mods2[[i]] <- svm_mod
+}
+
+# iterate over all the models
+for (i in 1:length(svm_mods2)) {
+  
+  # get training and validation set predictions
+  svm_tr_preds <- predict(svm_mods2[[i]], train_set)
+  svm_val_preds <- predict(svm_mods2[[i]], val_set)
+  
+  # create confusion matrix and get performance stats
+  svm_tr_stats <- confusionMatrix(table(svm_tr_preds, train_class), positive = "1", mode = "prec_recall")
+  svm_val_stats <- confusionMatrix(table(svm_val_preds, val_class), positive = "1", mode = "prec_recall")
+  
+  # enter results into data frame
+  svm_performance_df_class_wt[i, 1] <- "unweighted"
+  svm_performance_df_class_wt[i, 2] <- "training"
+  svm_performance_df_class_wt[i, 4] <- svm_tr_stats$byClass[5]
+  svm_performance_df_class_wt[i, 5] <- svm_tr_stats$byClass[6]
+  svm_performance_df_class_wt[i, 6] <- svm_tr_stats$byClass[7]
+  svm_performance_df_class_wt[i, 7] <- svm_tr_stats$byClassoverall[1]
+
+  svm_performance_df_class_wt[i + 7, 1] <- "unweighted"
+  svm_performance_df_class_wt[i + 7, 2] <- "validation"
+  svm_performance_df_class_wt[i + 7, 4] <- svm_val_stats$byClass[5]
+  svm_performance_df_class_wt[i + 7, 5] <- svm_val_stats$byClass[6]
+  svm_performance_df_class_wt[i + 7, 6] <- svm_val_stats$byClass[7]
+  svm_performance_df_class_wt[i + 7, 7] <- svm_val_stats$overall[1]
+}
+```
+
+```{r eval=FALSE}
+# create outcome data frame for performances on weighted dfm
+# (this is unncessary extra steps, but was done separately so the code is 
+# separate)
+svm_performance_df_wt_class_wt <- data.frame(dfm_type = NA,
+                                 dataset = NA,
+                                 cost = rep(Cs, 4),
+                                 precision = NA, 
+                                 recall = NA, 
+                                 f1 = NA, 
+                                 accuracy = NA)
+```
+
+```{r cache=TRUE, eval=FALSE}
+# initialise list to store svm models
+svm_mods_wt <- list()
+
+# iterate over each cost hyperparamter
+for (i in 1:length(Cs)) {
+
+  svm_mod_wt <- svm(x = train_set_wght[,],
+                 y = train_class,
+                 kernel = "linear",
+                 class.weights = c("0" = 0.2148,
+                                   "1" = 0.7852),
+                 cost = Cs[i])
+
+  # save into list object
+  svm_mods_wt[[i]] <- svm_mod_wt
+}
+```
+
+```{r cache=TRUE, eval=FALSE}
+# iterate over all the models
+for (i in 1:length(svm_mods_wt)) {
+  
+  # get training and validation set predictions
+  svm_tr_preds_wt <- predict(svm_mods_wt[[i]], train_set_wght)
+  svm_val_preds_wt <- predict(svm_mods_wt[[i]], val_set_wght)
+  
+  # create confusion matrix and get performance stats
+  svm_tr_stats_wt <- confusionMatrix(table(svm_tr_preds_wt, train_class), positive = "1", mode = "prec_recall")
+  
+  # enter results into data frame
+  svm_performance_df_wt_class_wt[i, 1] <- "weighted"
+  svm_performance_df_wt_class_wt[i, 2] <- "training"
+  svm_performance_df_wt_class_wt[i, 4] <- svm_tr_stats_wt$byClass[5]
+  svm_performance_df_wt_class_wt[i, 5] <- svm_tr_stats_wt$byClass[6]
+  svm_performance_df_wt_class_wt[i, 6] <- svm_tr_stats_wt$byClass[7]
+  svm_performance_df_wt_class_wt[i, 7] <- svm_tr_stats_wt$overall[1]
+
+  svm_performance_df_wt_class_wt[i + 7, 1] <- "weighted"
+  svm_performance_df_wt_class_wt[i + 7, 2] <- "validation"
+  svm_performance_df_wt_class_wt[i + 7, 4] <- svm_val_stats_wt$byClass[5]
+  svm_performance_df_wt_class_wt[i + 7, 5] <- svm_val_stats_wt$byClass[6]
+  svm_performance_df_wt_class_wt[i + 7, 6] <- svm_val_stats_wt$byClass[7]
+  svm_performance_df_wt_class_wt[i + 7, 7] <- svm_val_stats_wt$overall[1]
+
+}
+```
+
+```{r}
+# read in data frame stored
+svm_performance_df_class_wt <- readRDS("svm_performance_df_wt.RDS")
+svm_performance_df_wt_class_wt <- readRDS("svm_performance_df_wt_class_wt.RDS")
+
+# turn off scientific notation for table
+options(scipen = 100)
+
+# round values
+svm_performance_df_class_wt[,-c(1:3)] <- round(svm_performance_df_class_wt[,-c(1:3)], 3)
+svm_performance_df_class_wt[c(4:7, 11:14), 3] <- round(svm_performance_df_class_wt[c(4:7, 11:14), 3], 1)
+svm_performance_df_wt_class_wt[,-c(1:3)] <- round(svm_performance_df_wt_class_wt[,-c(1:3)], 3)
+svm_performance_df_wt_class_wt[c(4:7, 11:14), 3] <- round(svm_performance_df_wt_class_wt[c(4:7, 11:14), 3], 1)
+
+# update column name
+colnames(svm_performance_df_wt_class_wt)[3] <- "cost"
+
+svm_performance_df <- rbind(svm_performance_df_class_wt, 
+                            svm_performance_df_wt_class_wt)[1:28,]
+
+svm_performance_df_display <- svm_performance_df %>% 
+  arrange(cost, dfm_type, dataset) 
+
+rownames(svm_performance_df_display) <- NULL
+
+# choose top five models
+svm_performance_df_display[c(5:14),] %>% 
+  kbl(booktabs = T, 
+      row.names = F,
+      caption = "Linear SVM model performance") %>% 
+  kable_styling(latex_options =  c("striped", "HOLD_position"), 
+                full_width = FALSE) %>% 
+  row_spec(4, bold = T)
+```
+
+## Random Forest
+
+The random forest (RF) model fits decision trees to many boostrapped sample of the training data, where at each split only a portion of all features is considered for the split. This model therefore reduces the variance of a single decision tree by taking multiple samples, and it also decorrelates the trees by adding regularization and preventing overfitting. This works well for text classification since RF is suited for dealing with high-dimensional and noisy data.
+
+To select the model hyperparameters, I used a randomized grid search over discrete values of different tuning parameters, shown in the table below. First I tuned "mtry", the number of features to consider at each tree split (with values between 0.5 to 3.5 times the square root of the total number of features). Other hyperparamters I tuned included ones which control the tree size and complexity including "min.node.size", the minimal node size, "max.depth", the maximal tree depth, and the overall number of trees to build, "num.trees". A model which is too complex may overfit the training data, so therefore hyperparameter tuning is important. I again added a class weights hyperparameters to account for the class imbalance.
+
+```{r cache=TRUE}
+# create random hyperparameter grid 
+# used help from source: 
+# https://bradleyboehmke.github.io/HOML/random-forest.html
+hp_grid <- expand.grid(
+  mtry = floor(sqrt(nfeat(train_set)) * c(0.5, 1, 1.5, 2, 
+                                          2.5, 3, 3.5)),
+  # control tree complexity
+  # increasing node size decreses tree size and complexity 
+  min.node.size = c(1, 3, 5), 
+  num.trees = c(50:500),
+  max.depth = c(50:250)
+)
+
+data.frame(hyperparameter = c("mtry", "min.node.size", "num.trees", "max.depth"),
+           values = c("35, 70, 105, 140, 176, 211, 246",
+                      "1, 3, 5", 
+                      "50 - 500", 
+                      "50 - 250")) %>% 
+  kbl(booktabs = T, 
+      caption = "Hyperparameter values used for grid search for random forest model") %>% 
+  kable_styling(latex_options =  c("striped", "HOLD_position"), 
+                full_width = FALSE)
+```
+
+```{r cache=TRUE, eval=FALSE}
+# initialise lists for models and 
+# hyperparameters
+rf_models_clwt <- list()
+hyperparameters_clwt <- list()
+
+# execute grid search
+for(i in c(1:5)) {
+  
+  # sample value from grid
+  hp_sample <- hp_grid[sample(nrow(hp_grid), 1), ]
+  
+  # save hyperparameters 
+  hyperparameters_clwt[[i]] <- hp_sample
+  
+  # fit model for ith hyperparameter combination
+  rf_mod <- ranger(
+    x               = train_set[,],
+    y               = train_class,
+    mtry            = hp_sample[1, 1],
+    min.node.size   = hp_sample[1, 2],
+    num.trees       = hp_sample[1, 3],
+    max.depth       = hp_sample[1, 4],
+    case.weights    = tr_weights,
+    importance      = "impurity",
+    classification  = TRUE,
+    verbose         = TRUE,
+    seed            = 123
+  )
+
+  # save model to list
+  rf_models_clwt[[i]] <- rf_mod
+}
+```
+
+```{r eval=FALSE}
+# create data frame to store results
+rf_performance_df_class_wt <- data.frame(matrix(unlist(hyperparameters_clwt),
+                                                nrow = 5,
+                                                byrow = TRUE))
+
+# set column names
+colnames(rf_performance_df_class_wt) <- colnames(hyperparameters_clwt[[1]])
+
+# iterate over all the models
+for (i in 1:length(rf_models_clwt)) {
+  
+  # get errors
+  rf_tr_conf_mat <- table(predict(rf_models_clwt[[i]], train_set)$predictions, train_class)
+  rf_val_conf_mat <- table(predict(rf_models_clwt[[i]], val_set)$predictions, val_class)
+  
+  # get performance stats
+  rf_tr_performance <- confusionMatrix(rf_tr_conf_mat, positive = "1", mode = "prec_recall")
+  rf_val_performance <- confusionMatrix(rf_val_conf_mat, positive = "1", mode = "prec_recall")
+  
+  # enter into data frame 
+  rf_performance_df_class_wt[i, 5] <- "training"
+  rf_performance_df_class_wt[i, 6] <- rf_tr_performance$byClass[5]
+  rf_performance_df_class_wt[i, 7] <- rf_tr_performance$byClass[6]
+  rf_performance_df_class_wt[i, 8] <- rf_tr_performance$byClass[7]
+  rf_performance_df_class_wt[i, 9] <- rf_tr_performance$overall[1]
+  
+  rf_performance_df_class_wt[i + 5, 5] <- "validation"
+  rf_performance_df_class_wt[i + 5, 6] <- rf_val_performance$byClass[5]
+  rf_performance_df_class_wt[i + 5, 7] <- rf_val_performance$byClass[6]
+  rf_performance_df_class_wt[i + 5, 8] <- rf_val_performance$byClass[7]
+  rf_performance_df_class_wt[i + 5, 9] <- rf_val_performance$overall[1]
+}
+
+# rename data frame columns
+colnames(rf_performance_df_class_wt)[5:9] <- c("dataset",
+                                               "precision",
+                                               "recall",
+                                               "f1",
+                                               "accuracy")
+```
+
+```{r cache=TRUE, eval=FALSE}
+# Perform same exact analysis but with class weights and wegithed dfm
+rf_models_wt_clwt <- list()
+hyperparameters_wt_clwt <- list()
+
+# execute grid search
+for(i in c(1:10)) {
+  
+  # sample value from grid
+  hp_sample <- hp_grid[sample(nrow(hp_grid), 1), ]
+  
+  # save hyperparameters 
+  hyperparameters_wt_clwt[[i]] <- hp_sample
+  
+  # fit model for ith hyperparameter combination
+  rf_mod <- ranger(
+    x               = train_set_wght[,],
+    y               = train_class,
+    mtry            = hp_sample[1, 1],
+    min.node.size   = hp_sample[1, 2],
+    num.trees       = hp_sample[1, 3],
+    max.depth       = hp_sample[1, 4],
+    case.weights    = tr_weights,
+    importance      = "impurity",
+    classification  = TRUE,
+    verbose         = TRUE,
+    seed            = 123
+  )
+
+  # save model to list
+  rf_models_wt_clwt[[i]] <- rf_mod
+}
+```
+
+```{r eval=FALSE}
+# create data frame to store results
+rf_performance_df_wt_class_wt <- data.frame(matrix(unlist(hyperparameters_wt_clwt),
+                                                nrow = 10,
+                                                byrow = TRUE))
+
+rf_performance_df_wt_class_wt <- rbind(rf_performance_df_wt_class_wt, rf_performance_df_wt_class_wt)
+
+# set column names
+colnames(rf_performance_df_wt_class_wt) <- colnames(hyperparameters_wt_clwt[[1]])
+
+# iterate over all the models
+for (i in 1:length(rf_models_wt_clwt)) {
+  
+  # get errors
+  rf_tr_conf_mat_wt <- table(predict(rf_models_wt_clwt[[i]], train_set_wght)$predictions, train_class)
+  rf_val_conf_mat_wt <- table(predict(rf_models_wt_clwt[[i]], val_set_wght)$predictions, val_class)
+  
+  # get performance stats
+  rf_tr_performance <- confusionMatrix(rf_tr_conf_mat_wt, positive = "1", mode = "prec_recall")
+  (rf_val_performance <- confusionMatrix(rf_val_conf_mat_wt, positive = "1", mode = "prec_recall"))
+  
+  # enter into data frame 
+  rf_performance_df_wt_class_wt[i, 5] <- "training"
+  rf_performance_df_wt_class_wt[i, 6] <- rf_tr_performance$byClass[5]
+  rf_performance_df_wt_class_wt[i, 7] <- rf_tr_performance$byClass[6]
+  rf_performance_df_wt_class_wt[i, 8] <- rf_tr_performance$byClass[7]
+  rf_performance_df_wt_class_wt[i, 9] <- rf_tr_performance$overall[1]
+  
+  rf_performance_df_wt_class_wt[i + 10, 5] <- "validation"
+  rf_performance_df_wt_class_wt[i + 10, 6] <- rf_val_performance$byClass[5]
+  rf_performance_df_wt_class_wt[i + 10, 7] <- rf_val_performance$byClass[6]
+  rf_performance_df_wt_class_wt[i + 10, 8] <- rf_val_performance$byClass[7]
+  rf_performance_df_wt_class_wt[i + 10, 9] <- rf_val_performance$overall[1]
+}
+
+# rename data frame columns
+colnames(rf_performance_df_wt_class_wt)[5:9] <- c("dataset",
+                                               "precision",
+                                               "recall",
+                                               "f1",
+                                               "accuracy")
+```
+
+I tested 40 different hyperparameter combinations on both the weighted and unweighted dfms, and the top 5 model results are shown below. The best performing model had an F1 score of 0.66 on the validation set, with the hyperparameters shown below in the bolded row in the table. This model was submitted as my third submission and yielded a 0.6587 F1 score on 20% of the test data.
+
+```{r}
+# read in saved data frame which combines above
+rf_performance_df_final <- readRDS("rf_performance_df_final.RDS")
+
+colnames(rf_performance_df_final)[3] <- "min node size"
+colnames(rf_performance_df_final)[4] <- "num trees"
+colnames(rf_performance_df_final)[5] <- "max depth"
+
+
+# select top models and remove dfm_type for 
+# visualisation
+rf_performance_df_final[c(1:4, 7:8, 25:28),] %>% 
+  kbl(booktabs = T, 
+      row.names = F,
+      caption = "Random forest model performance") %>% 
+  kable_styling(latex_options =  c("striped", "HOLD_position"), 
+                full_width = FALSE) %>% 
+  row_spec(8, bold = T) %>% 
+  column_spec(3:5, width = "1cm")
+```
+
+## Multi-Layer Perceptron Network Model
+
+Lastly, I tried the multi-layer perceptron network model (MLP). This domain of artificial neural networks perform well for many classification problems, including text classification. There are a number of tuning parameters whose performance tend to vary on the dataset at hand. However, because of the complexity of neural networks, they are also more difficult to identify problems and adjust the model accordingly. 
+
+Because of the time and computational constraint of running the models, I again performed a random grid search over different hyperparameter values, along with fixed hyperparameter values of: class weights, binary cross-entropy for the loss function (common for binary classification), and accuracy for the metric.
+
+The other hyperparameter values are shown in the table below. I selected three of the more popular optimizers, a set of a few different values for the number of nodes used in the first layer of the model ("units"), different epochs which tells the model how many cycles to go through the training set, and dropout rates ("dropout") which "determines the rate at which units are dropped for the linear tranformation of the inputs" (source: [Quanteda Classifiers](https://rdrr.io/github/quanteda/quanteda.classifiers/)). 
+
+```{r cache=TRUE}
+data.frame(hyperparameter = c("optimizer", "units", "epochs", "dropout"),
+           values = c("adam, rmsprop, sgd",
+                      "256, 512, 1024, 2048", 
+                      "5-15",
+                      "0.1 - 0.9 (increments of 0.1)")) %>% 
+  kbl(booktabs = T, 
+      caption = "Hyperparameter values used for grid search for MLP model") %>% 
+  kable_styling(latex_options =  c("striped", "HOLD_position"), 
+                full_width = FALSE)
+```
+
+Moreover, I simplified the dfm I was using for this model because after a few tries it appeared the model performed better on this particular dataset when it was higher-dimensional. Therefore, I re-processed a dfm to only exclude stopwords and URLs, and I still carried out the steps of stemming the words, adding the custom profanity counts, sentiment/emotion scores and number of capital letters. I only used a tf-idf weighted dfm for training the MLP.
+
+```{r cache=TRUE, eval=FALSE}
+# reprocessed the dfm to have more features 
+# make train corpus dfm, no stemming 
+mlp_train_dfm_nostem <- train_corpus %>%
+  tokens() %>% 
+  tokens_remove(c(stopwords("en"))) %>% 
+  dfm(
+    remove_url = TRUE,
+    stem = FALSE,
+    verbose = TRUE
+    ) 
+
+mlp_train_dfm_stem <- dfm(mlp_train_dfm_nostem, 
+                          stem = TRUE)
+
+# do the same to the test dfm 
+mlp_test_dfm_nostem <- test_corpus %>%
+  tokens() %>%
+  tokens_remove(c(stopwords("en"))) %>% 
+  dfm(
+    remove_url = TRUE,
+    stem = FALSE,
+    verbose = TRUE
+    )
+
+mlp_test_dfm_stem <- dfm(mlp_test_dfm_nostem, 
+                         stem = TRUE)
+```
+
+```{r cache=TRUE, eval=FALSE}
+# get common words between datasets 
+mlp_common_feats <- intersect(featnames(mlp_train_dfm_stem), featnames(mlp_test_dfm_stem))
+
+# combine the train and test dfms on 
+# the common features
+mlp_comb_dfm <- rbind(mlp_train_dfm_stem[,mlp_common_feats], 
+                      mlp_test_dfm_stem[,mlp_common_feats])
+
+# add attack as docvar
+docvars(mlp_comb_dfm, "attack") <- as.factor(c(docvars(mlp_train_dfm_stem, "attack"), rep(NA, 100000)))
+```
+
+```{r cache=TRUE, message=FALSE, warning=FALSE, eval=FALSE}
+# Add profanity count as custom feature again
+# apply dictionary to dfm to get counts of profanity
+mlp_train_profanity_dfm <- dfm_lookup(mlp_train_dfm_nostem,
+                                      dictionary = profanity_dict)
+
+mlp_test_profanity_dfm <- dfm_lookup(mlp_test_dfm_nostem,
+                                     dictionary = profanity_dict)
+
+## Add sentiment and emotion as custom featuresagain
+# apply dictionary to weighted training and testing data
+mlp_train_sent_dfm <- dfm_lookup(dfm_weight(mlp_train_dfm_nostem,
+                                        scheme = "prop"),
+                             dictionary = data_dictionary_NRC_copy)
+
+mlp_test_sent_dfm <- dfm_lookup(dfm_weight(mlp_test_dfm_nostem,
+                                        scheme = "prop"),
+                             dictionary = data_dictionary_NRC_copy)
+
+# remove the insignificant differences (anticipation and joy)
+mlp_train_sent_dfm <- mlp_train_sent_dfm[, -c(2, 5)] 
+mlp_test_sent_dfm <- mlp_test_sent_dfm[, -c(2, 5)]
+```
+
+```{r cache=TRUE, eval=FALSE}
+## Create final dfm again
+# add the custom features
+mlp_comb_dfm_custom <- cbind(mlp_comb_dfm, 
+                             # add sentiment and emotion proportion as featurs
+                             rbind(mlp_train_sent_dfm, mlp_test_sent_dfm),
+                             # add profanity count as features
+                             rbind(mlp_train_profanity_dfm, mlp_test_profanity_dfm))
+
+mlp_final_dfm <- cbind(mlp_comb_dfm_custom,
+                   rbind(as.dfm(data.frame(num_capital_words = train_num_capital_words)),
+                         as.dfm(data.frame(num_capital_words = test_num_capital_words))))
+
+# add back attack and doc id 
+# add attack docvar
+docvars(mlp_final_dfm, "attack") <- as.factor(c(docvars(mlp_train_dfm_stem, "attack"), rep(NA, 100000)))
+docvars(mlp_final_dfm, "id") <- c(docvars(mlp_train_dfm_stem, "id"), docvars(mlp_test_dfm_stem, "id"))
+```
+
+```{r cache=TRUE, eval=FALSE}
+# subset training and validation sets on 
+# weighted and unweighted dfm
+
+# subset unweighted dfm
+train_set <- mlp_final_dfm[tr,]
+val_set <- mlp_final_dfm[val,]
+test_set <- mlp_final_dfm[te,]
+
+# weight the dfm using tfidf
+final_dfm_wght <- dfm_tfidf(mlp_final_dfm)
+
+# subset weighted dfm
+train_set_wght <- final_dfm_wght[tr,]
+val_set_wght <- final_dfm_wght[val,]
+test_set_wght <- final_dfm_wght[te,]
+```
+
+```{r eval=FALSE}
+# initialize data frame to store results
+mlp_performance_df <- data.frame(units     = rep(NA, 20),
+                                 epochs    = rep(NA, 20),
+                                 dropout   = rep(NA, 20),
+                                 optimizer = rep(NA, 20),
+                                 dataset   = rep(NA, 20),
+                                 precision = rep(NA, 20),
+                                 recall    = rep(NA, 20),
+                                 f1        = rep(NA, 20),
+                                 accuracy  = rep(NA, 20)
+                                 )
+```
+
+```{r eval=FALSE}
+# create hyperparameter grid
+mlp_hp_grid <- expand.grid(
+  optimizer   = c("adam", "rmsprop", "sgd"),
+  units       = c(256, 512, 1024, 2048),
+  epochs      = c(5:20),
+  dropout     = seq(0.1, 0.9, 0.1)
+)
+
+# initialize place to store models
+mlp_hp_list <- list()
+mlp_mods <- list()
+
+# iterate over 5 models
+for (i in seq(1, 10, 2)) {
+  
+  # sample row value 
+  sample_idx <- sample(nrow(mlp_hp_grid), 1)
+
+  # save hyperparameters 
+  mlp_hp_list[[i]] <- mlp_hp_grid[sample_idx,]
+  
+  # run the model 
+  mlp_mod <- textmodel_mlp(
+    x              = train_set_wght,
+    y              = train_class,
+    optimizer      = mlp_hp_grid$optimizer[sample_idx],
+    loss           = "binary_crossentropy", 
+    metrics        = "accuracy",
+    units          = mlp_hp_grid$units[sample_idx],
+    epochs         = mlp_hp_grid$epochs[sample_idx],
+    dropout        = mlp_hp_grid$dropout[sample_idx],
+    class_weight   = list("0" = 0.2148, "1" = 0.7852),
+    verbose        = 2)
+  
+  # save model
+  mlp_mods[[i]] <- mlp_mod
+  
+  # predict training and validation classes
+  mlp_tr_pred <- predict(mlp_mod,  train_set_wght)
+  mlp_val_pred <- predict(mlp_mod,  val_set_wght)
+  
+  # save performance metrics 
+  mlp_tr_perform <- confusionMatrix(table(mlp_tr_pred, train_class), positive = "1", mode = "prec_recall")
+  mlp_val_perform <- confusionMatrix(table(mlp_val_pred, val_class), positive = "1", mode = "prec_recall")
+  
+  # save into data frame 
+  mlp_performance_df$units[i] <- mlp_hp_grid$units[sample_idx]
+  mlp_performance_df$epochs[i] <- mlp_hp_grid$epochs[sample_idx]
+  mlp_performance_df$dropout[i] <- mlp_hp_grid$dropout[sample_idx]
+  mlp_performance_df$optimizer[i] <- as.character(mlp_hp_grid$optimizer[sample_idx])
+  mlp_performance_df$dataset[i] <- "training"
+  mlp_performance_df$precision[i] <- mlp_tr_perform$byClass[5]
+  mlp_performance_df$recall[i] <- mlp_tr_perform$byClass[6]
+  mlp_performance_df$f1[i] <- mlp_tr_perform$byClass[7]
+  mlp_performance_df$accuracy[i] <- mlp_tr_perform$overall[1]
+  
+  mlp_performance_df$units[i + 1] <- mlp_hp_grid$units[sample_idx]
+  mlp_performance_df$epochs[i + 1] <- mlp_hp_grid$epochs[sample_idx]
+  mlp_performance_df$dropout[i + 1] <- mlp_hp_grid$dropout[sample_idx]
+  mlp_performance_df$optimizer[i + 1] <- as.character(mlp_hp_grid$optimizer[sample_idx])
+  mlp_performance_df$dataset[i + 1] <- "validation"
+  mlp_performance_df$precision[i + 1] <- mlp_val_perform$byClass[5]
+  mlp_performance_df$recall[i + 1] <- mlp_val_perform$byClass[6]
+  mlp_performance_df$f1[i + 1] <- mlp_val_perform$byClass[7]
+  mlp_performance_df$accuracy[i + 1] <- mlp_val_perform$overall[1]
+  
+}
+```
+
+The first five model results are shown in the table below.
+
+```{r cache=TRUE}
+mlp_performance_tab1 <- readRDS("mlp_perform_df.RDS")
+
+mlp_performance_tab1 %>% 
+  kbl(booktabs = T, 
+      row.names = F,
+      caption = "MLP model performance") %>% 
+  kable_styling(latex_options =  c("striped", "HOLD_position"), 
+                full_width = FALSE) %>% 
+  row_spec(10, bold = T)
+```
+
+```{r eval=FALSE}
+## Increase number of epochs for model using sgd optimizer
+# initialixe data frame 
+sgd_performance_df <- data.frame(
+                                 epochs    = rep(NA, 20),
+                                 dataset   = rep(NA, 20),
+                                 precision = rep(NA, 20),
+                                 recall    = rep(NA, 20),
+                                 f1        = rep(NA, 20),
+                                 accuracy  = rep(NA, 20)
+                                 )
+```
+
+```{r eval=FALSE}
+# initialize storing of models
+sgd_mods <- list()
+
+# iterate from 10 to 60 epochs
+for (i in seq(10, 60, 5)) {
+  
+  sgd_mod <- textmodel_mlp(
+    x              = train_set_wght[,],
+    y              = train_class,
+    units          = 512,
+    epochs         = i,
+    optimizer      = "sgd",
+    loss           = "binary_crossentropy", 
+    metrics        = "accuracy",
+    dropout        = 0.8,
+    class_weight   = list("0" = 0.2148, "1" = 0.7852),
+    verbose        = 2)
+  
+  # save model
+  sgd_mods[[i]] <- sgd_mod
+  
+  # predict training and validation classes
+  sgd_tr_pred <- predict(sgd_mods,  train_set_wght)
+  sgd_val_pred <- predict(sgd_mods,  val_set_wght)
+  
+  # save performance metrics 
+  sgd_tr_perform <- confusionMatrix(table(sgd_tr_pred, train_class), positive = "1", mode = "prec_recall")
+  sgd_val_perform <- confusionMatrix(table(sgd_val_pred, val_class), positive = "1", mode = "prec_recall")
+  
+    # save into data frame 
+  sgd_performance_df$epochs[i] <- i
+  sgd_performance_df$dataset[i] <- "training"
+  sgd_performance_df$precision[i] <- sgd_tr_perform$byClass[5]
+  sgd_performance_df$recall[i] <- sgd_tr_perform$byClass[6]
+  sgd_performance_df$f1[i] <- sgd_tr_perform$byClass[7]
+  sgd_performance_df$accuracy[i] <- sgd_tr_perform$overall[1]
+  
+  sgd_performance_df$epochs[i + 1] <- i
+  sgd_performance_df$dataset[i + 1] <- "training"
+  sgd_performance_df$precision[i + 1] <- sgd_val_perform$byClass[5]
+  sgd_performance_df$recall[i + 1] <- sgd_val_perform$byClass[6]
+  sgd_performance_df$f1[i + 1] <- sgd_val_perform$byClass[7]
+  sgd_performance_df$accuracy[i + 1] <- sgd_val_perform$overall[1]
+}
+```
+
+Above, because the training scores were lower but validation scores still relatively high for the gradient descent optimizer, "sgd", I assumed the model was still underfitting to the data. Since SGD in deep learning exposes one observation at a time to the network as input, it is a slower algorithm than the others.
+
+Therefore, to continue tuning the model, I fixed the rest of the parameters (at 512 units and a 0.8 dropout rate) and attempted to improve the model performance by increasing the number of epochs. I expected this would improve performance since it gives the model more cycles through the data to learn it. This was successful and the results are shown in the table below for the SGD optimizer at different numbers of epochs, with 70 epochs resulting in the best performance.
+
+Between 70 and 100 epochs, the validation set F1 score does not improve much, nor does the test set score in the competition. This suggests the model starts to overfit during an epoch between these two. Given more time, this is something that should be validated by looking at values in between and by cross-validating the results on other folds of the dataset.
+
+```{r cache=TRUE}
+sgd_performance_df <- readRDS("sgd_performance_df.RDS") 
+
+sgd_performance_df[c(3:4, 7:18),] %>% 
+    kbl(booktabs = T, 
+      row.names = F,
+      caption = "MLP model performance with SGD optimizer") %>% 
+  kable_styling(latex_options =  c("striped", "HOLD_position"), 
+                full_width = FALSE) %>% 
+  row_spec(12, bold = T)
+```
+
+```{r eval=FALSE}
+mlp_best_mod <- textmodel_mlp(
+    x              = mlp_train_set_wght[,],
+    y              = train_class,
+    units          = 512,
+    epochs         = 70,
+    optimizer      = "sgd",
+    loss           = "binary_crossentropy", 
+    metrics        = "accuracy",
+    dropout        = 0.8,
+    class_weight   = list("0" = 0.2148, "1" = 0.7852),
+    verbose        = 2)
+```
+
+```{r eval=FALSE}
+# predict the labels for the test set
+# (had to split in to becuase of memory limit)
+test_preds1 <- predict(mlp_best_mod,  test_set_wght[1:50000,], type = "class")
+test_preds2 <- predict(mlp_best_mod,  test_set_wght[50001:100000,], type = "class")
+
+# unname the vectors
+test_preds1 <- unname(test_preds1)
+test_preds2 <- unname(test_preds2)
+
+# combine the predictions
+test_preds <- append(as.character(test_preds1), as.character(test_preds2), after = length(test_preds1))
+```
+
+```{r eval=FALSE}
+# save to csv
+submission_df  <- data.frame(id = test_data$id,
+                             attack = as.factor(test_preds))
+
+rownames(submission_df) <- NULL
+
+write.csv(submission_df, "submission.csv", row.names = FALSE)
+```
+
+## Final Submissions and Conclusions
+
+Below is a table summary of the final submissions submitted to Kaggle as discussed in the previous sections. For each submission, it features the model type, adjustment from the previous submission, CV F1 score, and test F1 score. The MLP model using the SGD optimizer with 70 epochs had the best performance on both the validation and test data, bolded below.
+
+```{r}
+data.frame(submission      = c(1:7), 
+           model           = c("Naive Bayes", "Naive Bayes", "Random Forest",
+                                "MLP", "MLP", "MLP",
+                               "MLP"),
+           adjustment_made = c("none", "custom features", "use RF model",
+                               "use MLP model", "increase to 45 epochs",
+                               "increase to 70 epochs",
+                               "increase to 100 epochs"),
+           cv_f1           = c(0.5890, 0.6350, 0.6600,
+                               0.6680, 0.6810, 0.6893,
+                               0.6892),
+           test_f1         = c(0.5938, 0.6456, 0.6587,
+                               0.6904, 0.6952, 0.7033,
+                               0.6913)
+           ) %>% 
+  kbl(booktabs = T, 
+      row.names = F,
+      caption = "Kaggle submissions") %>% 
+  kable_styling(latex_options =  c("striped", "HOLD_position"), 
+                full_width = FALSE) %>% 
+  row_spec(6, bold = T)
+```
+
+In this analysis, I explored a number of ways to approach classifying text data. Although a many models performed similarly, they each use a unique approach to mapping and predicting the data. Although it ended up that the Multi-Layer Perceptron Network model was the best performing, selecting the best tuning parameters and text pre-processing steps for this model was limited by computational efficiency and time constraints. Moreover, there was not a very principled approach to understanding the model. 
+
+Therefore, with the pure aim of prediction, the MLP approach is superior. However, when it comes to understanding how the texts are used as data, interpretability, and error troubleshooting, other models such as SVM or Naive Bayes are perhaps more suitable. In future work, I would explore a wider range of hyperparameters for each model as well as explore different custom features and data cleaning aside from what is initially done here (e.g. look at use of pronouns, misspellings, emojis, readability/lexical diversity scores).
