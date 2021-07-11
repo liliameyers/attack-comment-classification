@@ -5,17 +5,10 @@
 
 ## Contents
 
-### report.Rmd
-* Cleaned and described Wikipedia Talk page comments using text analysis techniques
+### report.Rmd and report.pdf
+* Cleaned, described, and visualised aspects of Wikipedia Talk page comments using text analysis techniques 
 * Performed feature engineering on the comments  
 * Evaluated several machine learning techniques including Naive Bayes, LASSO, Random Forest, Multi-Layer Perceptron to classify comments
 
-### report.pdf
-* Knitted report.Rmd file including visualisations 
-
-### classifier.Rmd
+### classifier.Rmd and classifier.pdf
 * Code for the final model with the best F1 score on the test set
-
-### classifier.pdf
-* Knitted classifier.Rmd file 
-
