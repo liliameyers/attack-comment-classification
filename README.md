@@ -5,7 +5,7 @@
 
 ## Contents
 
-### report.Rmd and report.pdf
+### writeup.Rmd and writeup.pdf
 * Cleaned, described, and visualised aspects of Wikipedia Talk page comments using text analysis techniques 
 * Performed feature engineering on the comments  
 * Evaluated several machine learning techniques including Naive Bayes, LASSO, Random Forest, Multi-Layer Perceptron to classify comments
